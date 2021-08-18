@@ -816,11 +816,14 @@ __rollback_abort_col_var(WT_SESSION_IMPL *session, WT_REF *ref, wt_timestamp_t r
     WT_DECL_RET;
     WT_INSERT_HEAD *ins;
     WT_PAGE *page;
-    uint64_t recno, rle;
-    uint32_t i, j;
-    bool is_ondisk_stable, stable_update_found;
+    wt_timestamp_t hs_start_ts;
+    uint64_t hs_counter, next_hs_recno, recno, rle, representative_recno;
+    uint32_t hs_btree_id, i, j;
+    uint8_t *keyptr, keybuf[WT_INTPACK64_MAXSIZE];
+    const uint8_t *const_keyptr;
+    bool is_ondisk_stable, stable_update_found, next_hs_recno_valid;
 
-/* Hack to be removed. (XXX) */
+/* Hack to be removed (XXX). */
 #define MAX_SKIPPED 128
     struct skip skipped[MAX_SKIPPED];
     unsigned numskipped = 0;
@@ -828,13 +831,20 @@ __rollback_abort_col_var(WT_SESSION_IMPL *session, WT_REF *ref, wt_timestamp_t r
     /* We may not need the history cursor, so start it at NULL. */
     hs_cursor = NULL;
 
+    /*
+     * We're going to remember the next recno we saw in the history store. Use the boolean to know
+     * if next_hs_recno contains information; if next_hs_recno is WT_RECNO_OOB that means there are
+     * no more keys in the history store at all.
+     */
+    next_hs_recno_valid = false;
+
     page = ref->page;
 
     /* If a disk image exists, start from its recno. */
     if (page->dsk != NULL)
         recno = page->dsk->recno;
     else
-        /* Otherwise initialize the value to silence compiler complaints, but it won't be used.*/
+        /* Otherwise initialize the value to silence compiler complaints, but it won't be used. */
         recno = 0;
 
     /* Review the changes to the original on-page data items. */
@@ -877,19 +887,146 @@ __rollback_abort_col_var(WT_SESSION_IMPL *session, WT_REF *ref, wt_timestamp_t r
             else
                 WT_STAT_CONN_DATA_INCR(session, txn_rts_stable_rle_skipped);
             recno += rle;
+
+            /* If we know the next key in the history store, it should not be on this cell. */
+            WT_ASSERT(session,
+              next_hs_recno_valid == false || next_hs_recno == WT_RECNO_OOB ||
+                next_hs_recno >= recno);
             continue;
         }
 
-        for (j = 0; j < rle; j++) {
-            WT_ERR(__rollback_abort_ondisk_kv(
-              session, ref, cip, NULL, rollback_timestamp, recno + j, &is_ondisk_stable));
-            /* We can stop right away if the on-disk version is stable. */
-            if (is_ondisk_stable) {
-                if (rle > 1)
-                    WT_STAT_CONN_DATA_INCR(session, txn_rts_stable_rle_skipped);
-                break;
-            }
+        /*
+         * We didn't find a stable update, so we need to iterate through the keys in the cell; while
+         * the cell itself is uniform, each key might have its own separate history store contents
+         * that need attention.
+         *
+         * First visit the keys with history store contents and process them in the ordinary way.
+         * Then, if we skipped any keys, use the first key we skipped as a representative to check
+         * what to do with the rest.
+         */
+
+        /* We need the history cursor now. */
+        if (hs_cursor == NULL) {
+            WT_ERR(__wt_curhs_open(session, NULL, &hs_cursor));
+            /* As elsewhere, because rollback-to-stable runs exclusively. */
+            F_SET(hs_cursor, WT_CURSTD_HS_READ_COMMITTED);
+            /* Also allocate an item to look at the key. */
+            WT_ERR(__wt_scr_alloc(session, 0, &hs_key));
         }
+
+        /* Scan for history-store contents. Skip if we already know there aren't any. */
+        if (next_hs_recno_valid == false ||
+          (next_hs_recno != WT_RECNO_OOB && next_hs_recno < recno + rle)) {
+
+            /* We haven't seen a representative key yet. */
+            representative_recno = WT_RECNO_OOB;
+
+            j = 0;
+            while (j < rle) {
+                if (next_hs_recno_valid == false) {
+                    /* Look for the first entry under at least this recno. */
+                    keyptr = keybuf;
+                    WT_ERR(__wt_vpack_uint(&keyptr, 0, recno + j));
+                    hs_key->data = keybuf;
+                    hs_key->size = WT_PTRDIFF(keyptr, keybuf);
+                    hs_cursor->set_key(hs_cursor, 4, S2BT(session)->id, hs_key, WT_TS_NONE, 0);
+                    ret = __wt_curhs_search_near_after(session, hs_cursor);
+                    WT_ERR_NOTFOUND_OK(ret, true);
+                    if (ret == WT_NOTFOUND) {
+                        /* Found nothing at all following in history. */
+                        next_hs_recno_valid = true;
+                        next_hs_recno = WT_RECNO_OOB;
+                        if (representative_recno == WT_RECNO_OOB)
+                            representative_recno = recno + j;
+                        __addskip(
+                          session, skipped, &numskipped, MAX_SKIPPED, recno + j, recno + rle);
+                        /* This is not an error state. */
+                        ret = 0;
+                        break;
+                    }
+                    WT_ASSERT(session, ret == 0);
+
+                    /* Examine what we found. */
+                    WT_ERR(hs_cursor->get_key(
+                      hs_cursor, &hs_btree_id, hs_key, &hs_start_ts, &hs_counter));
+                    if (hs_btree_id != S2BT(session)->id) {
+                        /* Next HS key is in some other table. */
+                        next_hs_recno_valid = true;
+                        next_hs_recno = WT_RECNO_OOB;
+                        if (representative_recno == WT_RECNO_OOB)
+                            representative_recno = recno + j;
+                        __addskip(
+                          session, skipped, &numskipped, MAX_SKIPPED, recno + j, recno + rle);
+                        break;
+                    }
+                    /* We don't care what these are (here). */
+                    WT_UNUSED(hs_start_ts);
+                    WT_UNUSED(hs_counter);
+
+                    /* Fetch the recno out of the key we found into next_hs_recno. */
+                    next_hs_recno_valid = true;
+                    const_keyptr = hs_key->data;
+                    WT_ERR(__wt_vunpack_uint(&const_keyptr, hs_key->size, &next_hs_recno));
+                    WT_ASSERT(session, next_hs_recno != WT_RECNO_OOB);
+                }
+
+                /* We might actually be with this cell. */
+                if (next_hs_recno >= recno + rle) {
+                    if (representative_recno == WT_RECNO_OOB)
+                        representative_recno = recno + j;
+                    __addskip(session, skipped, &numskipped, MAX_SKIPPED, recno + j, recno + rle);
+                    break;
+                }
+
+                /* Move to the next key we found. */
+                WT_ASSERT(session, next_hs_recno >= recno + j);
+                if (next_hs_recno > recno + j) {
+                    j = next_hs_recno - recno;
+
+                    /* We're going to skip the key recno + j. */
+                    if (representative_recno == WT_RECNO_OOB)
+                        representative_recno = recno + j;
+                    __addskip(
+                      session, skipped, &numskipped, MAX_SKIPPED, recno + j, next_hs_recno - recno);
+                }
+                next_hs_recno_valid = false;
+
+                /* Process this key. */
+                WT_ERR(__rollback_abort_ondisk_kv(
+                  session, ref, cip, NULL, rollback_timestamp, recno + j, &is_ondisk_stable));
+
+                /* A stable on-disk value means, we're done and can skip the representative too. */
+                if (is_ondisk_stable) {
+                    if (rle > 1)
+                        WT_STAT_CONN_DATA_INCR(session, txn_rts_stable_rle_skipped);
+                    representative_recno = WT_RECNO_OOB;
+                    break;
+                }
+
+                /* Advance by one as the starting point for where to look next. */
+                j++;
+            }
+        } else {
+            representative_recno = recno;
+            __addskip(session, skipped, &numskipped, MAX_SKIPPED, recno, recno + rle);
+        }
+
+        /* Now, if we skipped some records, use the representative to process them. */
+        if (representative_recno != WT_RECNO_OOB) {
+            /* XXX hack */
+            unsigned k;
+            uint64_t rn;
+
+            for (k = 0; k < numskipped; k++) {
+                for (rn = skipped[k].lo; rn < skipped[k].hi; rn++) {
+                    WT_ERR(__rollback_abort_ondisk_kv(
+                      session, ref, cip, NULL, rollback_timestamp, rn, NULL));
+                }
+            }
+            numskipped = 0;
+        }
+
+        /* Done with this cell. */
         recno += rle;
     }
 

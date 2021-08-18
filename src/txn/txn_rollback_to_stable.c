@@ -779,6 +779,27 @@ err:
     return (ret);
 }
 
+/* Hack to be removed. (XXX) */
+struct skip {
+    uint64_t lo, hi;
+};
+
+/*
+ * __addskip --
+ *     Hack to be removed. (XXX)
+ */
+static void
+__addskip(
+  WT_SESSION_IMPL *session, struct skip *arr, unsigned *n, unsigned max, uint64_t lo, uint64_t hi)
+{
+    /* This is not necessarily actually true, but it'll hold up for the tests we have. */
+    WT_ASSERT(session, *n < max);
+
+    arr[*n].lo = lo;
+    arr[*n].hi = hi;
+    (*n)++;
+}
+
 /*
  * __rollback_abort_col_var --
  *     Abort updates on a variable length col leaf page with timestamps newer than the rollback
@@ -795,6 +816,11 @@ __rollback_abort_col_var(WT_SESSION_IMPL *session, WT_REF *ref, wt_timestamp_t r
     uint64_t recno, rle;
     uint32_t i, j;
     bool is_ondisk_stable, stable_update_found;
+
+/* Hack to be removed. (XXX) */
+#define MAX_SKIPPED 128
+    struct skip skipped[MAX_SKIPPED];
+    unsigned numskipped = 0;
 
     page = ref->page;
     /*

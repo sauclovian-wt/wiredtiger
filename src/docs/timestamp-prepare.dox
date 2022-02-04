@@ -56,18 +56,20 @@ inconsistency.
 In this scenario the second transaction depends on the first; thus it must be
 rolled back if the first transaction is rolled back; thus it must not become
 durable before the first transaction.
-Applications that create gaps between their commit timestamps and durable
-timestamps are responsible for either not reading in those gaps, or establishing
-an ordering for the durable timestamps of their commits to make sure that
-this scenario cannot occur.
-(Note that for the purposes of this issue the commit timestamp of a non-prepared
-transaction is also its durable timestamp, and committing with no timestamp is
-roughly comparable to committing at the current stable timestamp.)
+To help prevent this, reads between the commit and durable
+timestamp will fail with ::WT_ROLLBACK if the global stable timestamp has not
+yet advanced to the durable timestamp. Retrying such transactions will
+eventually succeed as long as either they are retried at a later timestamp or
+the stable timestamp continues to move forward.
 
-\warning
-This scenario is not currently detected by WiredTiger; applications are
-responsible for avoiding it.
-In future versions such transactions might fail.
+\warning It is also possible to create data inconsistency by reading such a
+transaction's writes <i>after</i> its durable timestamp and committing without a
+timestamp, if the global stable timestamp has not yet reached the durable
+timestamp. (This can involve either reading with a read timestamp after the
+durable timestamp, or reading with no read timestamp, as the latter reads the
+latest committed values.) Applications using the delayed durable timestamp
+feature should be cautious about committing with no write timestamp to ensure
+that conflicts of this type cannot arise.
 
 @section timestamp_prepare_ignore_prepare Configuring ignore_prepare
 

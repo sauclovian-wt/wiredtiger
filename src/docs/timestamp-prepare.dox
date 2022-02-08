@@ -57,7 +57,7 @@ In this scenario the second transaction depends on the first; thus it must be
 rolled back if the first transaction is rolled back; thus it must not become
 durable before the first transaction.
 To help prevent this, reads between the commit and durable
-timestamp will fail with ::WT_ROLLBACK if the global stable timestamp has not
+timestamp will fail with ::WT_PREPARE_CONFLICT if the global stable timestamp has not
 yet advanced to the durable timestamp. Retrying such transactions will
 eventually succeed as long as either they are retried at a later timestamp or
 the stable timestamp continues to move forward.

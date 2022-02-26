@@ -51,7 +51,6 @@ When a transaction has a durable timestamp later than its commit timestamp,
 reading its writes in a second transaction and then committing other writes such
 that the second transaction becomes durable before the first can produce data
 inconsistency. Such commits are prohibited.
-
 In this scenario the second transaction depends on the first; thus it must be
 rolled back if the first transaction is rolled back; thus it must not become
 durable before the first transaction.

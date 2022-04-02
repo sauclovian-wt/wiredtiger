@@ -277,11 +277,6 @@ class test_hs06(wttest.WiredTigerTestCase):
             self.assertEquals(value2, cursor[self.create_key(i)])
         self.session.rollback_transaction()
 
-        self.session.begin_transaction('read_timestamp=' + self.timestamp_str(6))
-        for i in range(1, 11):
-            self.assertEquals(value2, cursor[self.create_key(i)])
-        self.session.rollback_transaction()
-
     def test_hs_multiple_updates(self):
         # Create a small table.
         uri = "table:test_hs06"

@@ -266,7 +266,7 @@ class test_hs06(wttest.WiredTigerTestCase):
         prepare_session.commit_transaction(
             'commit_timestamp=' + self.timestamp_str(5) + ',durable_timestamp=' + self.timestamp_str(6))
 
-        # Cannot read between commit and durable.
+        # Specifically check that we can read between commit and durable.
         self.session.begin_transaction('read_timestamp=' + self.timestamp_str(5))
         for i in range(1, 11):
             self.assertEquals(value2, cursor[self.create_key(i)])

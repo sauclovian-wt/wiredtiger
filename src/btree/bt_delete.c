@@ -50,7 +50,7 @@
  * to instantiate such a page, it creates an empty page from scratch.
  *
  * This feature is not available for FLCS objects. While most of the machinery exists (it is mostly
- * a property of column-store internal pages) but there is a showstopper problem. For VLCS, truncate
+ * a property of column-store internal pages) there is a showstopper problem. For VLCS, truncate
  * introduces gaps in the namespace, and we can just skip over those gaps when iterating and
  * instantiate fresh pages if rows in the gap are updated. For FLCS, because there are no deleted
  * values (deleted values read back as 0) we have to iterate _through_ gaps, and that means knowing
@@ -66,6 +66,30 @@
  * problematic in its own right) or we don't know where to stop when iterating. The latter problems
  * could conceivably be avoided by never fast-deleting the last page in the tree, but there's no
  * good way to know when we're on the last page.
+ *
+ * For VLCS trees, there is a complication. If we create gaps in the namespace, we can fill those
+ * gaps by using the append list of the next leaf page to the left. That is, if an internal page has
+ * children beginning at 100, 120, 140, and 160, and the two middle pages get truncated and
+ * discarded, we now have an internal page with children beginning at 100 and 160. Writes between
+ * 120 and 159 will be sent to the page beginning at 100 and populate its append list, eventually
+ * resulting in splits and new child pages. However, if we discard the _first_ (leftmost) child of
+ * an internal page, this logic breaks. Given an internal page with children beginning at 100, 120,
+ * 140, and 160, if we discard the page that begins at 100 we now have an internal page that itself
+ * begins at 100 but whose children begin at 120, 140, and 160. Now if someone goes to write at 110,
+ * Search quite reasonably assumes that this should go to some child of this internal page; but
+ * there isn't one and it asserts. There are two reasonable ways to handle this situation: one is to
+ * use the in-memory split code to insert a new ref on demand (this is logically very similar to a
+ * reverse split); the other is to avoid ever discarding the leftmost child. It was decided that the
+ * split operation is delicate and risky and it was better to preserve that page. This requires
+ * special-case code in four places: (a) in split, for VLCS trees, don't discard the first child ref
+ * in splits, even if it's deleted and the deletion is globally visible; (b) in VLCS trees, don't
+ * attempt reverse splits originating from that page, as that would discard it; (c) when loading an
+ * internal page, create an extra ref in this position if the first on-disk child starts at a later
+ * recno from the internal page itself; and (d) in verify, accept that the page in this position
+ * might be an empty deleted ref with no on-disk address. Note that the critical issue is not
+ * _discarding_ this page after deleting it. It is fine for it to _be_ deleted, as long as the ref
+ * always exists when the internal page is in memory. (It is not written to disk either; internal
+ * page reconciliation skips it.)
  */
 
 /*
